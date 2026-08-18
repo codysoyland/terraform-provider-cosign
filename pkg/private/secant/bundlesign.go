@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -23,12 +25,15 @@ import (
 	ggcrtypes "github.com/google/go-containerregistry/pkg/v1/types"
 	intotov1 "github.com/in-toto/attestation/go/v1"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
-	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	ociremote "github.com/sigstore/cosign/v3/pkg/oci/remote"
 	ctypes "github.com/sigstore/cosign/v3/pkg/types"
 	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
+	protorekor "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
+	rekortilesclient "github.com/sigstore/rekor-tiles/v2/pkg/client"
+	rekortilespb "github.com/sigstore/rekor-tiles/v2/pkg/generated/protobuf"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/sign"
+	"github.com/sigstore/sigstore-go/pkg/util"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -41,6 +46,7 @@ type BundleSigner struct {
 	signingConfig   *root.SigningConfig
 	trustedMaterial root.TrustedMaterial
 	keypair         sign.Keypair
+	transport       http.RoundTripper
 
 	mu      sync.Mutex
 	certPEM []byte            // Cached PEM-encoded Fulcio certificate
@@ -53,6 +59,7 @@ type BundleSignerOption func(*bundleSignerConfig)
 type bundleSignerConfig struct {
 	signingConfig   *root.SigningConfig
 	trustedMaterial root.TrustedMaterial
+	transport       http.RoundTripper
 }
 
 // WithSigningConfig overrides the SigningConfig that would otherwise be loaded
@@ -66,6 +73,15 @@ func WithSigningConfig(sc *root.SigningConfig) BundleSignerOption {
 // from the public TUF root. Primarily a test seam.
 func WithTrustedMaterial(tm root.TrustedMaterial) BundleSignerOption {
 	return func(c *bundleSignerConfig) { c.trustedMaterial = tm }
+}
+
+// WithTransport sets the http.RoundTripper used for the Fulcio, timestamp
+// authority, and Rekor v2 requests made while signing, so callers can inject
+// instrumented transports (e.g. tracing/metrics). Rekor v1 log writes are not
+// covered: sigstore-go constructs that client internally with no transport
+// hook. When unset, the default transports are used.
+func WithTransport(t http.RoundTripper) BundleSignerOption {
+	return func(c *bundleSignerConfig) { c.transport = t }
 }
 
 // NewBundleSigner loads SigningConfig and TrustedMaterial from TUF (unless
@@ -98,12 +114,13 @@ func NewBundleSigner(oidc fulcio.OIDCProvider, opts ...BundleSignerOption) (*Bun
 		signingConfig:   cfg.signingConfig,
 		trustedMaterial: cfg.trustedMaterial,
 		keypair:         keypair,
+		transport:       cfg.transport,
 	}, nil
 }
 
-// signWithIDToken signs content via cbundle.SignData using an OIDC token,
-// which internally fetches a new Fulcio certificate. The cert is then
-// extracted from the resulting bundle and cached for future calls.
+// signWithIDToken signs content using an OIDC token, which internally
+// fetches a new Fulcio certificate. The cert is then extracted from the
+// resulting bundle and cached for future calls.
 // Must be called with bs.mu held.
 func (bs *BundleSigner) signWithIDToken(ctx context.Context, content sign.Content) ([]byte, error) {
 	idToken, err := bs.oidc.Provide(ctx, "sigstore")
@@ -111,7 +128,7 @@ func (bs *BundleSigner) signWithIDToken(ctx context.Context, content sign.Conten
 		return nil, fmt.Errorf("retrieving ID token: %w", err)
 	}
 
-	bundleBytes, err := cbundle.SignData(ctx, content, bs.keypair, idToken, nil, bs.signingConfig, bs.trustedMaterial, cbundle.SignOptions{})
+	bundleBytes, err := bs.signBundle(ctx, content, idToken, nil)
 	if err != nil {
 		return nil, fmt.Errorf("signing bundle: %w", err)
 	}
@@ -121,6 +138,228 @@ func (bs *BundleSigner) signWithIDToken(ctx context.Context, content sign.Conten
 	}
 
 	return bundleBytes, nil
+}
+
+// signBundle assembles sign.BundleOptions and invokes sigstore-go's
+// sign.Bundle directly instead of delegating to cosign's cbundle.SignData.
+// SignData constructs its Rekor clients internally with no way to supply an
+// HTTP transport (its SignOptions only cover Fulcio and the TSA), so building
+// every client here is what lets bs.transport cover the whole signing flow.
+// The construction mirrors SignData for the two modes secant uses: a fresh
+// Fulcio cert via OIDC (idToken set) or a previously cached cert (certPEM
+// set). Unlike SignData, the context is threaded through to the network
+// calls, so cancellation is honored and traces parent correctly.
+func (bs *BundleSigner) signBundle(ctx context.Context, content sign.Content, idToken string, certPEM []byte) ([]byte, error) {
+	bundleOpts := sign.BundleOptions{
+		Context:     ctx,
+		TrustedRoot: bs.trustedMaterial,
+	}
+
+	switch {
+	case idToken != "":
+		provider, err := bs.fulcioProvider()
+		if err != nil {
+			return nil, err
+		}
+		bundleOpts.CertificateProvider = provider
+		bundleOpts.CertificateProviderOptions = &sign.CertificateProviderOptions{IDToken: idToken}
+	case certPEM != nil:
+		bundleOpts.CertificateProvider = &localCertProvider{cert: certPEM}
+	default:
+		return nil, fmt.Errorf("either an OIDC token or a cached certificate is required")
+	}
+
+	tsas, err := bs.timestampAuthorities()
+	if err != nil {
+		return nil, err
+	}
+	bundleOpts.TimestampAuthorities = tsas
+
+	tlogs, usingRekorV2, err := bs.transparencyLogs()
+	if err != nil {
+		return nil, err
+	}
+	bundleOpts.TransparencyLogs = tlogs
+
+	// Rekor v2 does not timestamp entries, so a short-lived Fulcio cert can
+	// only be verified if a timestamp authority also witnessed the signature.
+	// Mirrors the equivalent check in cbundle.SignData.
+	if usingRekorV2 && len(tsas) == 0 && idToken != "" {
+		return nil, fmt.Errorf("a timestamp authority must be provided to request a short-lived certificate that will be logged to Rekor")
+	}
+
+	bundle, err := sign.Bundle(content, bs.keypair, bundleOpts)
+	if err != nil {
+		return nil, err
+	}
+	return protojson.Marshal(bundle)
+}
+
+// fulcioProvider selects the Fulcio service from the signing config and
+// builds a certificate provider for it, mirroring cbundle.SignData's
+// unexported (non-caching) provider but with bs.transport threaded through.
+// Non-caching is correct here: BundleSigner does its own cert caching.
+func (bs *BundleSigner) fulcioProvider() (sign.CertificateProvider, error) {
+	urls := bs.signingConfig.FulcioCertificateAuthorityURLs()
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no fulcio URLs provided in signing config")
+	}
+	svc, err := root.SelectService(urls, sign.FulcioAPIVersions, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("selecting fulcio service: %w", err)
+	}
+	return sign.NewFulcio(&sign.FulcioOptions{
+		BaseURL:   svc.URL,
+		Timeout:   30 * time.Second,
+		Retries:   1,
+		Transport: bs.transport,
+	}), nil
+}
+
+// timestampAuthorities builds a TSA client per service selected from the
+// signing config, with bs.transport threaded through.
+func (bs *BundleSigner) timestampAuthorities() ([]*sign.TimestampAuthority, error) {
+	urls := bs.signingConfig.TimestampAuthorityURLs()
+	if len(urls) == 0 {
+		return nil, nil
+	}
+	svcs, err := root.SelectServices(urls, bs.signingConfig.TimestampAuthorityURLsConfig(),
+		sign.TimestampAuthorityAPIVersions, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("selecting timestamp authority services: %w", err)
+	}
+	tsas := make([]*sign.TimestampAuthority, 0, len(svcs))
+	for _, svc := range svcs {
+		tsas = append(tsas, sign.NewTimestampAuthority(&sign.TimestampAuthorityOptions{
+			URL:       svc.URL,
+			Timeout:   30 * time.Second,
+			Retries:   1,
+			Transport: bs.transport,
+		}))
+	}
+	return tsas, nil
+}
+
+// transparencyLogs builds a Rekor client per service selected from the
+// signing config, and reports whether any of them is a Rekor v2 log.
+func (bs *BundleSigner) transparencyLogs() ([]sign.Transparency, bool, error) {
+	urls := bs.signingConfig.RekorLogURLs()
+	if len(urls) == 0 {
+		return nil, false, nil
+	}
+	svcs, err := root.SelectServices(urls, bs.signingConfig.RekorLogURLsConfig(),
+		sign.RekorAPIVersions, time.Now())
+	if err != nil {
+		return nil, false, fmt.Errorf("selecting rekor services: %w", err)
+	}
+	var usingRekorV2 bool
+	tlogs := make([]sign.Transparency, 0, len(svcs))
+	for _, svc := range svcs {
+		rekorOpts := &sign.RekorOptions{
+			BaseURL: svc.URL,
+			Timeout: 90 * time.Second,
+			Retries: 1,
+			Version: svc.MajorAPIVersion,
+		}
+		if svc.MajorAPIVersion == 2 {
+			usingRekorV2 = true
+			// Only replace the default client when instrumenting; otherwise
+			// sigstore-go constructs the stock rekor-tiles writer itself.
+			if bs.transport != nil {
+				w, err := newRekorV2Writer(svc.URL, bs.transport)
+				if err != nil {
+					return nil, false, err
+				}
+				rekorOpts.ClientV2 = w
+			}
+		}
+		tlogs = append(tlogs, sign.NewRekor(rekorOpts))
+	}
+	return tlogs, usingRekorV2, nil
+}
+
+// localCertProvider returns a previously fetched Fulcio certificate, mirroring
+// cbundle.SignData's unexported equivalent so the cached-cert path skips Fulcio.
+type localCertProvider struct {
+	cert []byte
+}
+
+func (c *localCertProvider) GetCertificate(context.Context, sign.Keypair, *sign.CertificateProviderOptions) ([]byte, error) {
+	block, _ := pem.Decode(c.cert)
+	if block == nil {
+		return nil, fmt.Errorf("could not decode cert")
+	}
+	return block.Bytes, nil
+}
+
+const (
+	// rekorV2AddPath and rekorV2MaxResponseSize mirror rekor-tiles' write client.
+	rekorV2AddPath         = "/api/v2/log/entries"
+	rekorV2MaxResponseSize = 10 * 1024 * 1024 // 10MB
+)
+
+// rekorV2Writer is a minimal Rekor v2 write client mirroring rekor-tiles'
+// write.Client, which cannot be used directly because its constructor accepts
+// no HTTP transport (only user agent, timeout, and TLS config knobs). It is
+// wire-compatible with the stock client: same endpoint, request encoding,
+// user agent, and timeout.
+type rekorV2Writer struct {
+	baseURL *url.URL
+	client  *http.Client
+}
+
+func newRekorV2Writer(baseURL string, t http.RoundTripper) (*rekorV2Writer, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing rekor URL %q: %w", baseURL, err)
+	}
+	return &rekorV2Writer{
+		baseURL: u,
+		client: &http.Client{
+			Transport: rekortilesclient.CreateRoundTripper(t, util.ConstructUserAgent()),
+			Timeout:   30 * time.Second,
+		},
+	}, nil
+}
+
+// Add implements sign.RekorV2Client.
+func (w *rekorV2Writer) Add(ctx context.Context, entry any) (*protorekor.TransparencyLogEntry, error) {
+	hr, ok := entry.(*rekortilespb.HashedRekordRequestV002)
+	if !ok {
+		return nil, fmt.Errorf("unsupported entry type: %T", entry)
+	}
+	payload, err := protojson.Marshal(&rekortilespb.CreateEntryRequest{
+		Spec: &rekortilespb.CreateEntryRequest_HashedRekordRequestV002{HashedRekordRequestV002: hr},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshaling rekor entry: %w", err)
+	}
+
+	endpoint := *w.baseURL
+	endpoint.Path = path.Join(endpoint.Path, rekorV2AddPath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("adding rekor entry: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, rekorV2MaxResponseSize))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("unexpected response: %v %v", resp.StatusCode, string(body))
+	}
+	tle := &protorekor.TransparencyLogEntry{}
+	if err := protojson.Unmarshal(body, tle); err != nil {
+		return nil, fmt.Errorf("unmarshaling response body: %w", err)
+	}
+	return tle, nil
 }
 
 // cacheCertFromBundle extracts the signing certificate from a serialized
@@ -157,10 +396,10 @@ func (bs *BundleSigner) certNeedsRefresh() bool {
 }
 
 // SignContent creates a protobuf bundle by signing the given content.
-// On first call (or when the cached cert is nearing expiry), delegates to
-// cbundle.SignData with an OIDC token, which fetches a new Fulcio cert
-// internally. The cert is extracted from the bundle and cached so that
-// subsequent calls pass it directly, skipping Fulcio entirely.
+// On first call (or when the cached cert is nearing expiry), signs with an
+// OIDC token, which fetches a new Fulcio cert internally. The cert is
+// extracted from the bundle and cached so that subsequent calls pass it
+// directly, skipping Fulcio entirely.
 func (bs *BundleSigner) SignContent(ctx context.Context, content sign.Content) ([]byte, error) {
 	// Lock scope is deliberately split: we hold the mutex across a cert
 	// refresh so concurrent callers coalesce onto a single Fulcio fetch,
@@ -185,7 +424,7 @@ func (bs *BundleSigner) SignContent(ctx context.Context, content sign.Content) (
 	// Steady state: sign with the cached cert, skipping Fulcio. Safe to
 	// run unlocked because certPEM is a local copy and the keypair /
 	// signingConfig / trustedMaterial fields are immutable after init.
-	bundle, err := cbundle.SignData(ctx, content, bs.keypair, "", certPEM, bs.signingConfig, bs.trustedMaterial, cbundle.SignOptions{})
+	bundle, err := bs.signBundle(ctx, content, "", certPEM)
 	if err != nil {
 		return nil, fmt.Errorf("signing bundle: %w", err)
 	}
